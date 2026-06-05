@@ -29,6 +29,8 @@ from app.libs.pricing_config import (
     get_plan_lookup_key,
     get_extra_seat_lookup_key,
     PLANS,
+    SELECTABLE_PLANS,
+    PRIMARY_PLAN,
 )
 from app.env import Mode, mode
 import asyncio
@@ -47,6 +49,42 @@ def _secret_debug_info(value: Optional[str]) -> str:
     v = str(value)
     prefix = "whsec_" if v.startswith("whsec_") else ("sk_live_" if v.startswith("sk_live_") else ("sk_test_" if v.startswith("sk_test_") else "set"))
     return f"{prefix} (len={len(v)})"
+
+# ---------------------
+# Tax enforcement
+# ---------------------
+def _enforce_automatic_tax(subscription_id: str, customer_id: str) -> None:
+    """
+    Guarantee VAT is always applied to a subscription.
+
+    Seat and plan changes RE-RATE the subscription (new line items / proration),
+    and direct SubscriptionItem/Subscription mutations do not inherit the
+    Checkout Session's automatic_tax setting. Without re-asserting it here, added
+    seats or a changed plan could be billed VAT-free. This is the root cause of
+    the "tax not applied" issues reported previously, so we enforce it on every
+    server-side subscription mutation.
+
+    We also require a billing address (country) on the customer, since Stripe can
+    only compute tax with a valid jurisdiction — otherwise VAT would silently be 0.
+    """
+    try:
+        customer = stripe.Customer.retrieve(customer_id)
+    except stripe.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Could not load Stripe customer for tax check: {e}") from e
+
+    address = (customer.get("address") or {}) if isinstance(customer, dict) else (getattr(customer, "address", None) or {})
+    country = address.get("country") if isinstance(address, dict) else getattr(address, "country", None)
+    if not country:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "A billing address (with country) is required so VAT can be calculated. "
+                "Please update the billing details before changing the subscription."
+            ),
+        )
+
+    # Idempotent: re-assert automatic tax on the subscription itself.
+    stripe.Subscription.modify(subscription_id, automatic_tax={"enabled": True})
 
 # Environment-based Stripe configuration
 if mode == Mode.PROD:
@@ -74,7 +112,7 @@ class CheckoutRequest(BaseModel):
     company_id: str
     success_url: str
     cancel_url: str
-    plan_type: str  # "starter" or "business"
+    plan_type: str = PRIMARY_PLAN  # single tier: "standard"
     billing_cycle: str  # "monthly" or "annual"
     extra_seats: int = 0  # additional seats beyond the plan's included users
 
@@ -113,9 +151,10 @@ async def create_checkout_session(request: CheckoutRequest, user_data: str = Dep
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="Stripe not configured")
 
-    # Validate plan parameters
-    if request.plan_type not in PLANS:
-        raise HTTPException(status_code=400, detail=f"Invalid plan_type: {request.plan_type}. Must be 'starter' or 'business'.")
+    # Validate plan parameters. Only the current single tier may be purchased;
+    # legacy plans remain resolvable elsewhere for existing subscriptions only.
+    if request.plan_type not in SELECTABLE_PLANS:
+        raise HTTPException(status_code=400, detail=f"Invalid plan_type: {request.plan_type}. Must be one of: {sorted(SELECTABLE_PLANS)}.")
     if request.billing_cycle not in ('monthly', 'annual'):
         raise HTTPException(status_code=400, detail=f"Invalid billing_cycle: {request.billing_cycle}. Must be 'monthly' or 'annual'.")
     if request.extra_seats < 0:
@@ -332,8 +371,9 @@ async def update_seats(request: UpdateSeatsRequest, current_user: str = Depends(
             
         subscription_record = sub_response.data[0]
         stripe_sub_id = subscription_record['stripe_subscription_id']
+        stripe_customer_id = subscription_record['stripe_customer_id']
         billing_cycle = subscription_record.get('billing_cycle', 'monthly')
-        
+
         # Get extra seat lookup key for this billing cycle
         seat_lookup_key = get_extra_seat_lookup_key(billing_cycle)
         seat_prices = stripe.Price.list(lookup_keys=[seat_lookup_key], active=True)
@@ -365,7 +405,11 @@ async def update_seats(request: UpdateSeatsRequest, current_user: str = Depends(
                     price=seat_price_id,
                     quantity=request.new_extra_seats
                 )
-                
+
+        # CRITICAL: re-assert VAT on the re-rated subscription so added seats are
+        # never billed tax-free.
+        _enforce_automatic_tax(stripe_sub.id, stripe_customer_id)
+
         # Update local DB optimistically (webhook will also update)
         supabase.table('subscriptions').update({
             'extra_seats': request.new_extra_seats
@@ -432,7 +476,11 @@ async def change_plan(request: ChangePlanRequest, current_user: str = Depends(re
             }],
             proration_behavior="create_prorations"
         )
-        
+
+        # CRITICAL: re-assert VAT on the re-rated subscription so the changed plan
+        # is never billed tax-free.
+        _enforce_automatic_tax(stripe_sub.id, subscription_record['stripe_customer_id'])
+
         # Update local DB optimistically (webhook will also update)
         supabase.table('subscriptions').update({
             'plan_type': request.new_plan_type,
