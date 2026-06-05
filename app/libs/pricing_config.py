@@ -5,14 +5,28 @@ Centralized pricing constants for the user-based pricing model.
 Used by checkout session creation, webhook handler, and user limit enforcement.
 
 Plans:
-  - Starter: Up to 3 users included
-  - Business: Up to 10 users included
-  - Extra seats: Available on both plans at €49/mo (or €34.30/mo annual)
+  - Standard: €199/mo net, 3 users included (annual = 2 months free → €1,990/yr)
+  - Extra seats: €49/mo net each (annual = 2 months free → €490/yr)
+
+Legacy (kept resolvable until all subscribers are migrated off them — see migration plan):
+  - Starter: 3 users included
+  - Business: 10 users included
 """
 
 from typing import Optional
 
+# Active plan offered to new customers. Single tier.
+PRIMARY_PLAN = "standard"
+
 PLANS = {
+    "standard": {
+        "included_users": 3,
+        "monthly_lookup_key": "standard_monthly",
+        "annual_lookup_key": "standard_annual",
+    },
+    # --- Legacy plans (no longer sold) -------------------------------------
+    # Retained ONLY so existing subscriptions still resolve during migration.
+    # Remove once no live subscription references these lookup keys.
     "starter": {
         "included_users": 3,
         "monthly_lookup_key": "starter_monthly",
@@ -24,6 +38,9 @@ PLANS = {
         "annual_lookup_key": "business_annual",
     },
 }
+
+# Plans that can be selected at checkout / used for new subscriptions.
+SELECTABLE_PLANS = {"standard"}
 
 EXTRA_SEAT = {
     "monthly_lookup_key": "extra_seat_monthly",
