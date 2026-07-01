@@ -30,30 +30,7 @@ router = APIRouter()
 
 # --- Variation library (small text pools drawn from at random) ---
 PROMPT_COMPONENTS = {
-    "openingExamples": {
-        "contact_person": [
-            "Herr {name} hat mich von Anfang an hervorragend begleitet",
-            "Frau {name} war mein Ansprechpartner und hat schnell Klarheit geschaffen"
-        ],
-        "highlight": [
-            "Besonders geholfen hat mir {highlight}",
-            "Was mich überzeugt hat: {highlight}"
-        ],
-        "reason": [
-            "Ich habe mich wegen {reason} an die Kanzlei gewandt",
-            "Anlass war {reason}"
-        ],
-        "feeling": [
-            "Ich fühlte mich durchweg {feeling}",
-            "Von Anfang an {feeling}"
-        ],
-        "neutral": [
-            "Sehr gute Erfahrung",
-            "Alles in allem eine runde Sache"
-        ]
-    },
     "transitions": ["Außerdem", "Zudem", "Besonders", "Darüber hinaus", "Nicht zuletzt", "Zusätzlich"],
-    "closings": ["kann ich nur empfehlen", "jederzeit wieder", "war die richtige Wahl", "bin sehr zufrieden", "würde ich jederzeit weiterempfehlen"],
     "softCritique": [
         "Die Antwort hätte stellenweise etwas schneller sein können, insgesamt aber top",
         "Kleine Rückfragen wurden zügig geklärt – unterm Strich sehr positiv"
@@ -107,7 +84,6 @@ class GenerateReviewRequest(BaseModel):
     recommendation: str # 'ja', 'nein', 'vielleicht'
     customer_uuid: str
     length: str = "mittel"  # accepted for backwards-compat; length is now randomized server-side
-    existing_reviews: list[str] = []  # List of existing review texts for uniqueness check
 
 class GenerateReviewResponse(BaseModel):
     """
@@ -175,26 +151,6 @@ def build_persona(request: "GenerateReviewRequest", display_contact: str) -> dic
     }
 
 
-def format_existing_reviews(reviews: list[str]) -> str:
-    """Format existing reviews for the prompt"""
-    if not reviews:
-        return ""
-
-    # Filter out empty reviews and limit to avoid token overflow
-    valid_reviews = [r.strip() for r in reviews if r and r.strip()]
-    if not valid_reviews:
-        return ""
-
-    # Format each review with a number
-    formatted = []
-    for i, review in enumerate(valid_reviews, 1):
-        # Truncate very long reviews to save tokens
-        truncated = review[:500] + "..." if len(review) > 500 else review
-        formatted.append(f"{i}. \"{truncated}\"")
-
-    return "\n".join(formatted)
-
-
 @router.post(
     "/generate-review",
     response_model=GenerateReviewResponse,
@@ -246,11 +202,7 @@ def generate_ai_review(
     emoji = random.choice(PROMPT_COMPONENTS["emojiSet"]) if use_emoji else ""
     soft_critique_text = random.choice(PROMPT_COMPONENTS["softCritique"]) if use_soft_critique else ""
 
-    # --- Step 4: Format existing reviews for uniqueness check ---
-    existing_reviews_text = format_existing_reviews(request.existing_reviews)
-    has_existing_reviews = bool(existing_reviews_text)
-
-    # --- Step 5: Construct the German prompt ---
+    # --- Step 4: Construct the German prompt ---
     prompt = f"""AUFGABE
 Erstelle eine natürliche Google-Bewertung auf Deutsch in ausschließlicher Ich-Perspektive.
 Gib NUR den Bewertungstext zurück – keine Einleitung, keine Labels.
@@ -293,21 +245,6 @@ SPEZIELLE ANWEISUNGEN
 {f"Füge Emoji hinzu: {emoji}" if use_emoji else ""}
 {f"Sanfte Kritik einbauen: {soft_critique_text}" if use_soft_critique else ""}
 
-{"EINZIGARTIGKEIT - KRITISCH WICHTIG" if has_existing_reviews else ""}
-{f'''Hier sind alle bestehenden Bewertungen dieses Unternehmens:
----
-{existing_reviews_text}
----
-
-STRENGE REGELN FÜR EINZIGARTIGKEIT:
-1. NIEMALS gleiche oder ähnliche Eröffnungssätze wie in bestehenden Bewertungen verwenden
-2. NIEMALS gleiche Phrasen, Redewendungen oder Formulierungen kopieren oder paraphrasieren
-3. ANDERE Satzstrukturen und Satzmuster verwenden als in den bestehenden Bewertungen
-4. ANDERE Wörter und Synonyme wählen - wenn bestehende Bewertungen "kompetent" sagen, nutze z.B. "fachkundig" oder "versiert"
-5. ANDEREN Fokus setzen - wenn bestehende Bewertungen den Service loben, betone z.B. die Kommunikation oder Erreichbarkeit
-6. Die generierte Bewertung muss sich VOLLSTÄNDIG von allen obigen Bewertungen unterscheiden
-7. Bei Ähnlichkeit zu einer bestehenden Bewertung: komplett neu formulieren''' if has_existing_reviews else ""}
-
 DATENFEHLER
 Fehlende Eingaben weglassen, ohne Platzhalter oder Entschuldigung.
 
@@ -315,11 +252,7 @@ AUSGABE
 Nur den finalen Bewertungstext zurückgeben, ohne Labels, Metadaten oder Anführungszeichen."""
 
     try:
-        # Build system message - add uniqueness instruction if existing reviews provided
         system_message = "Du bist ein Experte für natürliche deutsche Google-Bewertungen. Du schreibst authentische Bewertungen IMMER aus der Ich-Perspektive, als ob DU der Kunde bist. NIEMALS dritte Person (sie/man/er/es) verwenden! Befolge die Regeln exakt und variiere den Stil basierend auf den Vorgaben."
-
-        if has_existing_reviews:
-            system_message += " WICHTIG: Dir werden bestehende Bewertungen gezeigt. Deine generierte Bewertung MUSS sich vollständig davon unterscheiden - andere Eröffnung, andere Formulierungen, andere Struktur, andere Wortwahl. Keine Ähnlichkeiten erlaubt!"
 
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -327,7 +260,7 @@ Nur den finalen Bewertungstext zurückgeben, ohne Labels, Metadaten oder Anführ
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.9 if has_existing_reviews else 0.8,  # Higher temperature for more variation when avoiding duplicates
+            temperature=0.8,
             max_tokens=300,
         )
         generated_text = completion.choices[0].message.content
