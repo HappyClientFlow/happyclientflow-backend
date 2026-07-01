@@ -11,6 +11,8 @@ to emphasize. This makes reviews read like different real people rather than one
 author. There is deliberately NO per-customer or per-company fixed voice (a fixed
 voice would make a single business's reviews sound more alike, the opposite of the goal).
 """
+import os
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import databutton as db
@@ -19,9 +21,30 @@ import random
 
 from app.libs.reminder_scheduling import feedback_high_satisfaction_min
 
+
+def _get_openai_api_key() -> str | None:
+    """
+    Resolve the OpenAI API key, environment first.
+
+    The Databutton platform is retired, so the OPENAI_API_KEY should live in the
+    runtime environment (.env locally, Render env in prod). We read the env var
+    first and only fall back to db.secrets for backwards-compatibility; the
+    fallback can be removed once the key is set in the environment everywhere.
+    (Mirrors the pattern already used by the Stripe module.)
+    """
+    env_key = os.environ.get("OPENAI_API_KEY")
+    if env_key:
+        return env_key
+    try:
+        return db.secrets.get("OPENAI_API_KEY")
+    except Exception as e:
+        print(f"[ai_reviews] Could not load OPENAI_API_KEY from db.secrets: {e}")
+        return None
+
+
 # Initialize OpenAI client
 try:
-    client = OpenAI(api_key=db.secrets.get("OPENAI_API_KEY"))
+    client = OpenAI(api_key=_get_openai_api_key())
 except Exception as e:
     print(f"Error initializing OpenAI client: {e}")
     client = None
