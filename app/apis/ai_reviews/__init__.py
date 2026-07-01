@@ -28,6 +28,13 @@ except Exception as e:
 
 router = APIRouter()
 
+# Model + generation settings (kept as constants for easy tuning).
+# A stronger model than gpt-4o-mini produces markedly less formulaic prose,
+# which is the single biggest lever against reviews feeling "same-author".
+REVIEW_MODEL = "gpt-4o"
+REVIEW_TEMPERATURE = 0.85
+REVIEW_MAX_TOKENS = 600  # headroom for the "lang" corridor (up to ~9 sentences)
+
 # --- Variation library (small text pools drawn from at random) ---
 PROMPT_COMPONENTS = {
     "transitions": ["Außerdem", "Zudem", "Besonders", "Darüber hinaus", "Nicht zuletzt", "Zusätzlich"],
@@ -259,13 +266,13 @@ Nur den finalen Bewertungstext zurückgeben, ohne Labels, Metadaten oder Anführ
         system_message = "Du bist ein Experte für natürliche deutsche Google-Bewertungen. Du schreibst authentische Bewertungen IMMER aus der Ich-Perspektive, als ob DU der Kunde bist. NIEMALS dritte Person (sie/man/er/es) verwenden! Befolge die Regeln exakt und variiere den Stil basierend auf den Vorgaben."
 
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REVIEW_MODEL,
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.8,
-            max_tokens=300,
+            temperature=REVIEW_TEMPERATURE,
+            max_tokens=REVIEW_MAX_TOKENS,
         )
         generated_text = completion.choices[0].message.content
         if not generated_text:
