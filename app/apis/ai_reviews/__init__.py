@@ -237,6 +237,10 @@ Eingaben integrieren: grund_der_zusammenarbeit optional, highlight konkret hervo
 Zufriedenheit implizit ausdrücken („rundum zufrieden", „sehr gute Erfahrung"), keine Sterne nennen.
 Satzlängen mischen, Redundanzen vermeiden.
 
+NATÜRLICHKEIT (LEITPLANKEN)
+Keine künstlichen Tippfehler, Rechtschreib- oder Grammatikfehler einbauen – der Text muss korrekt sein.
+Keine erzwungene Synonym-Akrobatik: wenn ein einfaches, natürliches Wort passt (z. B. „super"), NICHT gekünstelt ausweichen (z. B. „formidabel"), nur um Wiederholungen zu vermeiden. Natürlich klingen geht vor Abwechslung um jeden Preis.
+
 LÄNGE
 Ziel: etwa {persona['target_sentences']} Sätze (Korridor {lo}–{hi}). Niemals nur ein knapper Einzeiler – immer mehrere aussagekräftige Sätze.
 
