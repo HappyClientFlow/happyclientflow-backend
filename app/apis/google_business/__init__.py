@@ -9,8 +9,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import urllib.parse
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any, Optional
 
 import databutton as db
@@ -129,8 +131,85 @@ def _parse_rfc3339(s: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _norm(s: str) -> str:
-    return " ".join(s.lower().split())
+# --- Review matching -------------------------------------------------------
+# Posting a reply is a PUBLIC action, so matching must be robust (tolerate Google
+# translation wrappers, minor edits, and short/abbreviated name forms) without ever
+# replying to the wrong review. We score each candidate with fuzzy text + token-aware
+# author + rating + time signals, then require a confident, unambiguous best match.
+MATCH_THRESHOLD = 0.66
+STRONG_TEXT_CONF = 0.90
+
+
+def _norm_text(s: str) -> str:
+    """Lowercase + collapse whitespace, and drop Google's translation wrapper."""
+    t = s or ""
+    low = t.lower()
+    # Google returns "(Translated by Google) <x> (Original) <y>" — keep the original half.
+    if "(original)" in low:
+        t = t[low.rindex("(original)") + len("(original)"):]
+    for marker in ("(translated by google)", "(übersetzt von google)"):
+        i = t.lower().find(marker)
+        if i != -1:
+            t = t[:i] + t[i + len(marker):]
+    return re.sub(r"\s+", " ", t.lower()).strip()
+
+
+def _norm_name(s: str) -> str:
+    """Normalize a display name to space-separated alphanumeric tokens (hyphens → spaces)."""
+    t = re.sub(r"[^a-z0-9äöüß]+", " ", (s or "").lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _text_sim(a: str, b: str) -> float:
+    na, nb = _norm_text(a), _norm_text(b)
+    if not na or not nb:
+        return 0.0
+    ratio = SequenceMatcher(None, na, nb).ratio()
+    # Containment covers truncation/edits where one text is a subset of the other.
+    short, lng = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(short) >= 20 and short in lng:
+        ratio = max(ratio, 0.9)
+    return ratio
+
+
+def _author_sim(a: str, b: str) -> float:
+    na, nb = _norm_name(a), _norm_name(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    ta, tb = set(na.split()), set(nb.split())
+    shared = ta & tb
+    if shared:
+        # A shared surname-length token (e.g. "haak" in "Bine Haak" vs "Sabine Thomas-Haak")
+        # is a decent corroborating signal; scale by token overlap.
+        strong = any(len(tok) >= 4 for tok in shared)
+        overlap = len(shared) / min(len(ta), len(tb))
+        return max(0.6 if strong else 0.4, overlap)
+    return SequenceMatcher(None, na, nb).ratio()
+
+
+def _match_confidence(
+    rating_match: bool, text: float, author: float, time_close: bool
+) -> tuple[float, str]:
+    """Confidence 0..1 that a candidate is the same review, plus a reason label."""
+    # 1) Body text is the most unique signal for these (often long) reviews.
+    if text >= 0.72:
+        c = 0.90
+        c += 0.05 if rating_match else 0.0
+        c += 0.03 if author >= 0.5 else 0.0
+        c += 0.02 if time_close else 0.0
+        return min(1.0, c), "text_strong"
+    # 2) Partial body match (edited / translated) backed by rating + author/time.
+    if text >= 0.45 and rating_match and (author >= 0.5 or time_close):
+        c = 0.70 + (0.05 if author >= 0.5 else 0.0) + (0.03 if time_close else 0.0)
+        return min(1.0, c), "text_partial"
+    # 3) Rating-only review on Google (no usable body): need a strong author + rating + time.
+    if text < 0.25 and rating_match and author >= 0.75 and time_close:
+        return 0.67, "author_rating_time"
+    # 4) Not confident.
+    base = text * 0.6 + author * 0.2 + (0.08 if rating_match else 0.0) + (0.05 if time_close else 0.0)
+    return round(base, 4), "weak"
 
 
 def _find_matching_review(
@@ -139,46 +218,62 @@ def _find_matching_review(
     author_name: str,
     review_text: str,
     target_ts: Optional[float],
-) -> Optional[str]:
-    """Return review resource name if found."""
+) -> tuple[Optional[str], float, str]:
+    """
+    Return (review_resource_name | None, best_confidence, reason).
+
+    None is returned when no candidate clears MATCH_THRESHOLD, or when the best two
+    candidates are too close to tell apart (ambiguity guard) — better to fail than to
+    post a public reply on the wrong review.
+    """
     items = reviews_payload.get("reviews") or []
-    author_norm = _norm(author_name or "")
-    text_prefix = (review_text or "").strip()[:80]
+
     best_name: Optional[str] = None
-    best_score = 0
+    best_conf = 0.0
+    best_reason = "no_reviews"
+    second_conf = 0.0
 
     for rev in items:
         name = rev.get("name") or ""
+        if not name:
+            continue
         st = _star_enum_to_int(rev.get("starRating"))
         reviewer = (rev.get("reviewer") or {}).get("displayName") or ""
         comment = (rev.get("comment") or "").strip()
         ct = _parse_rfc3339(rev.get("createTime"))
         ct_ts = ct.timestamp() if ct else None
 
-        score = 0
-        if st == rating:
-            score += 5
-        if text_prefix and comment.startswith(text_prefix[: min(len(comment), len(text_prefix))]):
-            score += 4
-        elif text_prefix and text_prefix[:40] in comment:
-            score += 3
-        if author_norm and _norm(reviewer) == author_norm:
-            score += 3
-        elif author_norm and author_norm[:5] in _norm(reviewer):
-            score += 1
-        if target_ts is not None and ct_ts is not None:
-            if abs(ct_ts - target_ts) < 86400 * 3:
-                score += 2
+        rating_match = rating > 0 and st == rating
+        text = _text_sim(review_text, comment)
+        author = _author_sim(author_name, reviewer)
+        time_close = (
+            target_ts is not None
+            and ct_ts is not None
+            and abs(ct_ts - target_ts) <= 3 * 86400
+        )
 
-        if score > best_score:
-            best_score = score
+        conf, reason = _match_confidence(rating_match, text, author, time_close)
+
+        if conf > best_conf:
+            second_conf = best_conf
+            best_conf = conf
             best_name = name
+            best_reason = reason
+        elif conf > second_conf:
+            second_conf = conf
 
-    if best_score >= 8 and best_name:
-        return best_name
-    if best_score >= 6 and best_name:
-        return best_name
-    return None
+    # Ambiguity guard: unless the body text itself is a strong match (near-unique),
+    # require the winner to be clearly ahead of the runner-up before posting.
+    ambiguous = (
+        best_conf < STRONG_TEXT_CONF
+        and second_conf > 0.0
+        and (best_conf - second_conf) < 0.08
+    )
+    if best_name and best_conf >= MATCH_THRESHOLD and not ambiguous:
+        return best_name, best_conf, best_reason
+    if ambiguous:
+        return None, best_conf, best_reason + "+ambiguous"
+    return None, best_conf, best_reason
 
 
 class CreateGoogleOAuthLinkRequest(BaseModel):
@@ -421,6 +516,13 @@ def post_google_review_reply(body: PostGoogleReviewReplyRequest):
 
     target_ts = float(body.review_unix_ts) if body.review_unix_ts else None
 
+    # Diagnostics so a failure tells us WHY (no API access vs. no reviews vs. weak score).
+    best_conf = 0.0
+    best_reason = "no_reviews"
+    locations_scanned = 0
+    total_reviews_seen = 0
+    last_v4_error: Optional[str] = None
+
     for acc in accounts:
         acc_name = acc.get("name")
         if not acc_name:
@@ -446,21 +548,75 @@ def post_google_review_reply(body: PostGoogleReviewReplyRequest):
                 continue
             payload = _list_reviews_v4(access, loc_name)
             if payload.get("_error"):
+                # Don't swallow silently — remember it so we can report an access issue.
+                last_v4_error = payload["_error"]
+                print(
+                    f"[google_business] reviews read error loc={loc_name!r}: "
+                    f"{str(payload['_error'])[:300]}"
+                )
                 continue
-            match = _find_matching_review(
+            locations_scanned += 1
+            total_reviews_seen += len(payload.get("reviews") or [])
+            match, conf, reason = _find_matching_review(
                 payload,
                 body.rating,
                 body.author_name,
                 body.review_text,
                 target_ts,
             )
+            if conf > best_conf:
+                best_conf = conf
+                best_reason = reason
             if match:
                 _put_reply_v4(access, match, body.reply_text.strip())
-                return {"ok": True, "review_name": match}
+                print(
+                    f"[google_business] post-reply matched company={body.company_id!r} "
+                    f"profile={body.profile_id!r} conf={conf:.2f} reason={reason!r} "
+                    f"review={match!r}"
+                )
+                return {
+                    "ok": True,
+                    "review_name": match,
+                    "match_confidence": round(conf, 3),
+                }
 
+    # Nothing matched — log the shape of the failure before returning.
+    print(
+        f"[google_business] post-reply NO MATCH company={body.company_id!r} "
+        f"profile={body.profile_id!r} accounts={len(accounts)} "
+        f"locations_scanned={locations_scanned} reviews_seen={total_reviews_seen} "
+        f"best_conf={best_conf:.2f} best_reason={best_reason!r} "
+        f"v4_error={(last_v4_error or '')[:300]!r}"
+    )
+
+    # No reviews came back at all → this is an access/permission problem, not a match miss.
+    if total_reviews_seen == 0:
+        if last_v4_error:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Google returned an error while reading reviews for this location. "
+                    "This usually means the Google Business Profile (My Business v4) API "
+                    "is not enabled/approved for the project, or the connected account "
+                    "lacks review permission. Please reply manually for now."
+                ),
+            )
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No reviews were returned for the connected Google Business location. "
+                "Check that the connected Google account manages this exact location, "
+                "or reply manually."
+            ),
+        )
+
+    # Reviews were readable but none matched confidently → surface how close we got.
     raise HTTPException(
         status_code=404,
-        detail="Could not match this review in Google Business Profile. Check account, location, or reply manually.",
+        detail=(
+            "Could not confidently match this review in Google Business Profile "
+            f"(closest match {best_conf:.0%}). Please verify the review details or reply manually."
+        ),
     )
 
 
