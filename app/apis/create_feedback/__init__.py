@@ -101,22 +101,64 @@ def get_supabase_service_client():
     return create_client(supabase_url, service_key)
 
 
+# review_status is a forward-only funnel. Ranked lowest→highest so an external-review
+# click can never drag a record backwards: a late/duplicate click (e.g. the customer
+# re-opens the feedback link after the review was already verified as ReviewComplete)
+# must NOT revert "Abgeschlossen" back to "Externe Bewertung gestartet".
+# Unknown/NULL statuses rank 0 → a click still advances them to ExternalReviewStarted.
+_REVIEW_STATUS_RANK = {
+    "ReviewSent": 1,
+    "ReviewStarted": 2,
+    "FeedbackSubmitted": 3,
+    "ExternalReviewStarted": 4,
+    "ReviewComplete": 5,
+}
+_EXTERNAL_REVIEW_STARTED_RANK = _REVIEW_STATUS_RANK["ExternalReviewStarted"]
+
+
 def _record_external_review_platform_click(supabase: Client, client_id: str) -> dict:
     """
     Cancels pending *survey* reminders, sets clicked_google_link (any external review CTA),
-    and sets review_status to ExternalReviewStarted (off-site review opened, not verified).
+    and advances review_status to ExternalReviewStarted (off-site review opened, not verified).
+
+    review_status is monotonic: if the client has already reached a state at or beyond
+    ExternalReviewStarted (notably ReviewComplete, set when a public review is verified),
+    the status is PRESERVED — a repeat/late click never downgrades it. clicked_google_link
+    and external_review_clicked_at are still refreshed.
     Use ReviewComplete when publication is confirmed (e.g. mark_google_review_published).
     Google-review follow-up nudges stay pending until google_review_published is set.
     """
     n = cancel_pending_survey_reminders_for_client(supabase, client_id)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    supabase.from_("clients").update(
-        {
-            "clicked_google_link": True,
-            "review_status": "ExternalReviewStarted",
-            "external_review_clicked_at": now,
-        }
-    ).eq("id", client_id).execute()
+
+    # Read current status first so we never write a status lower than the current one.
+    current_res = (
+        supabase.from_("clients")
+        .select("review_status")
+        .eq("id", client_id)
+        .limit(1)
+        .execute()
+    )
+    current_rows = getattr(current_res, "data", None) or []
+    current_status = current_rows[0].get("review_status") if current_rows else None
+    already_advanced = (
+        _REVIEW_STATUS_RANK.get(current_status or "", 0) >= _EXTERNAL_REVIEW_STARTED_RANK
+    )
+
+    update_payload = {
+        "clicked_google_link": True,
+        "external_review_clicked_at": now,
+    }
+    if already_advanced:
+        # Preserve ExternalReviewStarted/ReviewComplete — do not downgrade.
+        print(
+            f"mark_external_review_clicked: preserving review_status={current_status!r} "
+            f"for client_id={client_id!r} (no downgrade on repeat click)"
+        )
+    else:
+        update_payload["review_status"] = "ExternalReviewStarted"
+
+    supabase.from_("clients").update(update_payload).eq("id", client_id).execute()
 
     verify = (
         supabase.from_("clients")
@@ -132,7 +174,13 @@ def _record_external_review_platform_click(supabase: Client, client_id: str) -> 
             status_code=404,
             detail="Client not found after update.",
         )
-    if not row.get("clicked_google_link") or row.get("review_status") != "ExternalReviewStarted":
+    final_status = row.get("review_status")
+    # Success = click recorded AND status is at least ExternalReviewStarted
+    # (either freshly advanced, or a preserved higher state like ReviewComplete).
+    if (
+        not row.get("clicked_google_link")
+        or _REVIEW_STATUS_RANK.get(final_status or "", 0) < _EXTERNAL_REVIEW_STARTED_RANK
+    ):
         print(
             f"mark_external_review_clicked: update did not persist for client_id={client_id!r} "
             f"row={row!r}"
@@ -146,7 +194,7 @@ def _record_external_review_platform_click(supabase: Client, client_id: str) -> 
         "message": "OK",
         "reminders_cancelled": n,
         "clicked_google_link": row.get("clicked_google_link"),
-        "review_status": row.get("review_status"),
+        "review_status": final_status,
     }
 
 
