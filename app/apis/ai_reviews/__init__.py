@@ -61,10 +61,6 @@ REVIEW_MAX_TOKENS = 600  # headroom for the "lang" corridor (up to ~9 sentences)
 # --- Variation library (small text pools drawn from at random) ---
 PROMPT_COMPONENTS = {
     "transitions": ["Außerdem", "Zudem", "Besonders", "Darüber hinaus", "Nicht zuletzt", "Zusätzlich"],
-    "softCritique": [
-        "Die Antwort hätte stellenweise etwas schneller sein können, insgesamt aber top",
-        "Kleine Rückfragen wurden zügig geklärt – unterm Strich sehr positiv"
-    ],
     "emojiSet": ["😊", "😉", "👍"]
 }
 
@@ -78,12 +74,14 @@ PERSONA_LENGTHS = {
     "lang": (6, 9),
 }
 
-# tone -> label + optional-element probabilities (transition / emoji / soft critique)
+# tone -> label + optional-element probabilities (transition / emoji).
+# NOTE: no "soft critique" axis — these are high-satisfaction (5-star) reviews, so the
+# generator must never invent criticism or drawbacks (see positive-only guardrail below).
 PERSONA_TONES = {
-    "sachlich":             {"label": "sachlich und nüchtern",         "transition": 0.30, "emoji": 0.00, "softcritique": 0.10},
-    "warm":                 {"label": "warm und persönlich",           "transition": 0.45, "emoji": 0.05, "softcritique": 0.15},
-    "begeistert":           {"label": "begeistert und lebendig",       "transition": 0.50, "emoji": 0.10, "softcritique": 0.08},
-    "nuechtern_empfehlend": {"label": "ruhig und klar empfehlend",     "transition": 0.35, "emoji": 0.00, "softcritique": 0.10},
+    "sachlich":             {"label": "sachlich und nüchtern",         "transition": 0.30, "emoji": 0.00},
+    "warm":                 {"label": "warm und persönlich",           "transition": 0.45, "emoji": 0.05},
+    "begeistert":           {"label": "begeistert und lebendig",       "transition": 0.50, "emoji": 0.10},
+    "nuechtern_empfehlend": {"label": "ruhig und klar empfehlend",     "transition": 0.35, "emoji": 0.00},
 }
 
 PERSONA_STRUCTURES = {
@@ -226,11 +224,9 @@ def generate_ai_review(
     # --- Step 3: Apply tone-driven optional elements ---
     use_transition = random.random() < tone["transition"]
     use_emoji = random.random() < tone["emoji"]
-    use_soft_critique = random.random() < tone["softcritique"]
 
     transition = random.choice(PROMPT_COMPONENTS["transitions"]) if use_transition else ""
     emoji = random.choice(PROMPT_COMPONENTS["emojiSet"]) if use_emoji else ""
-    soft_critique_text = random.choice(PROMPT_COMPONENTS["softCritique"]) if use_soft_critique else ""
 
     # --- Step 4: Construct the German prompt ---
     prompt = f"""AUFGABE
@@ -248,7 +244,11 @@ wuerde_empfehlen: {request.recommendation}
 AUSGABE-BEDINGUNGEN
 "wuerde_empfehlen" darf NUR erwähnt werden, wenn Wert = "ja". Bei "nein" oder "vielleicht": ignorieren.
 "ansprechpartner" darf NUR verwendet werden, wenn ein konkreter Name angegeben ist.
-Negative Details nur dezent und direkt positiv entkräften.
+
+NUR POSITIV (WICHTIG)
+Dies ist eine rundum positive Bewertung. Erfinde KEINE Kritik, Schwächen, Einschränkungen oder Verbesserungswünsche.
+Keine relativierenden oder abschwächenden Aussagen ("hätte schneller sein können", "manchmal", "kleine Abstriche", "unterm Strich", "trotzdem", "abgesehen davon").
+Falls eine Eingabe leicht negativ oder neutral klingt: weglassen oder ausschließlich positiv formulieren – niemals als Kritik wiedergeben.
 
 STILVARIATION (zufällige Persona für genau diese Bewertung)
 Tonalität: {tone['label']}
@@ -256,7 +256,6 @@ Aufbau: {PERSONA_STRUCTURES[persona['structure_key']]}
 Schwerpunkt: Beginne bzw. betone {PERSONA_EMPHASES[persona['emphasis_key']]}
 Übergänge verwenden: {use_transition}
 Emoji erlaubt: {use_emoji}
-Sanfte Kritik: {use_soft_critique}
 
 TEXTREGELN
 WICHTIG - PERSPEKTIVE: Die Bewertung wird von MIR als Kunde geschrieben. Ausschließlich Ich-Form verwenden!
@@ -277,7 +276,6 @@ Ziel: etwa {persona['target_sentences']} Sätze (Korridor {lo}–{hi}). Niemals 
 SPEZIELLE ANWEISUNGEN
 {f"Verwende Übergang: {transition}" if use_transition else ""}
 {f"Füge Emoji hinzu: {emoji}" if use_emoji else ""}
-{f"Sanfte Kritik einbauen: {soft_critique_text}" if use_soft_critique else ""}
 
 DATENFEHLER
 Fehlende Eingaben weglassen, ohne Platzhalter oder Entschuldigung.
