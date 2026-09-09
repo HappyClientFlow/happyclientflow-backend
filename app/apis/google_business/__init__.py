@@ -434,6 +434,20 @@ def _list_locations(access_token: str, account_name: str) -> list[dict]:
     return r.json().get("locations") or []
 
 
+def _v4_parent(account_name: str, location_name: str) -> str:
+    """
+    Build the v4 review parent: accounts/{aid}/locations/{lid}.
+
+    The v1 Business Information API returns location names as "locations/{lid}"
+    (no account prefix), while the v4 reviews API requires the account-scoped form.
+    Passing the v1 name straight through yields v4/locations/{lid}/reviews, which is
+    not a valid v4 path and returns a generic HTML 404 — not a JSON API error.
+    """
+    loc_id = (location_name or "").rstrip("/").split("/")[-1]
+    acc = (account_name or "").rstrip("/")
+    return f"{acc}/locations/{loc_id}"
+
+
 def _list_reviews_v4(access_token: str, parent_accounts_locations: str) -> dict:
     """parent_accounts_locations: accounts/{aid}/locations/{lid} — paginated."""
     url = f"{MYBUSINESS_V4}/{parent_accounts_locations}/reviews"
@@ -546,13 +560,15 @@ def post_google_review_reply(body: PostGoogleReviewReplyRequest):
             loc_name = loc.get("name")
             if not loc_name:
                 continue
-            payload = _list_reviews_v4(access, loc_name)
+            # v1 gives "locations/{lid}"; v4 needs "accounts/{aid}/locations/{lid}".
+            v4_parent = _v4_parent(acc_name, loc_name)
+            payload = _list_reviews_v4(access, v4_parent)
             if payload.get("_error"):
                 # Don't swallow silently — remember it so we can report an access issue.
                 last_v4_error = payload["_error"]
                 print(
-                    f"[google_business] reviews read error loc={loc_name!r}: "
-                    f"{str(payload['_error'])[:300]}"
+                    f"[google_business] reviews read error parent={v4_parent!r} "
+                    f"(loc={loc_name!r}): {str(payload['_error'])[:300]}"
                 )
                 continue
             locations_scanned += 1
@@ -589,18 +605,40 @@ def post_google_review_reply(body: PostGoogleReviewReplyRequest):
         f"v4_error={(last_v4_error or '')[:300]!r}"
     )
 
-    # No reviews came back at all → this is an access/permission problem, not a match miss.
+    # No reviews came back at all → distinguish the failure shapes rather than
+    # blaming API access for every error (an HTML 404 means a bad URL, not access).
     if total_reviews_seen == 0:
         if last_v4_error:
-            raise HTTPException(
-                status_code=502,
-                detail=(
+            err_text = str(last_v4_error)
+            err_low = err_text.lower()
+            if "<!doctype html" in err_low or "error 404 (not found)" in err_low:
+                detail = (
+                    "Google returned 404 for the reviews endpoint of this location. "
+                    "The request did not reach the Business Profile API. "
+                    "Please reply manually and report this — it needs a fix on our side."
+                )
+            elif "permission" in err_low or "forbidden" in err_low:
+                detail = (
+                    "Google denied permission to read reviews for this location. "
+                    "The connected Google account needs owner/manager rights with review "
+                    "access on this exact location. Please reply manually for now."
+                )
+            elif "has not been used in project" in err_low or "is disabled" in err_low:
+                detail = (
+                    "The Google Business Profile (My Business v4) API is not enabled for "
+                    "our project. Please reply manually while we enable it."
+                )
+            elif "scope" in err_low:
+                detail = (
+                    "The Google connection is missing the required permission scope. "
+                    "Please reconnect Google Business in Settings, then try again."
+                )
+            else:
+                detail = (
                     "Google returned an error while reading reviews for this location. "
-                    "This usually means the Google Business Profile (My Business v4) API "
-                    "is not enabled/approved for the project, or the connected account "
-                    "lacks review permission. Please reply manually for now."
-                ),
-            )
+                    "Please reply manually for now."
+                )
+            raise HTTPException(status_code=502, detail=detail)
         raise HTTPException(
             status_code=404,
             detail=(
