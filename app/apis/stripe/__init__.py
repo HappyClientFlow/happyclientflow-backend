@@ -111,9 +111,10 @@ else:
 # secret, as a comma-separated list (e.g. "card,paypal,sepa_debit").
 #
 # Every method named must be activated on the Stripe account and must support
-# recurring payments, or session creation fails outright — hence the fallback in
-# create_checkout_session.
-DEFAULT_CHECKOUT_PAYMENT_METHOD_TYPES = ["card", "paypal"]
+# recurring payments, or session creation fails outright. create_checkout_session
+# therefore drops whichever method Stripe complains about and retries, so one
+# misconfigured method cannot cost us the card guarantee that this ticket is about.
+DEFAULT_CHECKOUT_PAYMENT_METHOD_TYPES = ["card", "paypal", "klarna", "sepa_debit"]
 
 
 def _resolve_billing_email(company: Dict[str, Any]) -> Optional[str]:
@@ -197,6 +198,51 @@ class UpdateSeatsRequest(BaseModel):
 class ChangePlanRequest(BaseModel):
     company_id: str
     new_plan_type: str
+
+def _create_session_dropping_bad_methods(checkout_params: Dict[str, Any]):
+    """
+    Create the Checkout Session, retiring individual payment methods Stripe refuses.
+
+    A method that is not activated on the account, or that does not support
+    subscriptions, makes the entire session fail — one bad entry would otherwise
+    take checkout down. Stripe names the offending method in the error, so drop
+    that one and try again. Only if nothing can be salvaged do we fall back to
+    Stripe's dynamic methods, which is the case where the card guarantee is lost,
+    so it is logged loudly.
+    """
+    params = dict(checkout_params)
+    # At most one attempt per configured method, plus the dynamic fallback.
+    for _ in range(len(params.get('payment_method_types') or []) + 1):
+        try:
+            return stripe.checkout.Session.create(**params)
+        except stripe.InvalidRequestError as e:
+            message = str(e)
+            if 'payment_method_type' not in message:
+                raise
+
+            current = list(params.get('payment_method_types') or [])
+            rejected = [m for m in current if f"'{m}'" in message or f'"{m}"' in message]
+
+            if rejected and len(current) > len(rejected):
+                remaining = [m for m in current if m not in rejected]
+                print(
+                    f"[STRIPE] Stripe refused payment method(s) {rejected}: {message} "
+                    f"Retrying with {remaining}. Activate them in Stripe or drop them "
+                    "from STRIPE_PAYMENT_METHOD_TYPES."
+                )
+                params['payment_method_types'] = remaining
+                continue
+
+            print(
+                f"[STRIPE] Could not satisfy payment_method_types={current}: {message} "
+                "Falling back to Stripe's dynamic payment methods — card is no longer "
+                "guaranteed until STRIPE_PAYMENT_METHOD_TYPES is fixed."
+            )
+            params.pop('payment_method_types', None)
+
+    # Loop exhausted without returning: try once more with whatever is left.
+    return stripe.checkout.Session.create(**params)
+
 
 @router.post("/create-checkout-session", response_model=CheckoutResponse)
 async def create_checkout_session(request: CheckoutRequest, user_data: str = Depends(require_auth)):
@@ -317,23 +363,7 @@ async def create_checkout_session(request: CheckoutRequest, user_data: str = Dep
             'payment_method_types': get_checkout_payment_method_types(),
         }
 
-        try:
-            session = stripe.checkout.Session.create(**checkout_params)
-        except stripe.InvalidRequestError as e:
-            # A method that is not activated on the account, or does not support
-            # subscriptions, makes the whole session fail. Losing checkout entirely
-            # is worse than losing the guarantee, so fall back to Stripe's dynamic
-            # methods and make the misconfiguration loud in the logs.
-            if 'payment_method_type' not in str(e):
-                raise
-            print(
-                "[STRIPE] Checkout rejected payment_method_types="
-                f"{checkout_params.get('payment_method_types')}: {e}. "
-                "Retrying with Stripe's dynamic payment methods — fix "
-                "STRIPE_PAYMENT_METHOD_TYPES or activate the method in Stripe."
-            )
-            checkout_params.pop('payment_method_types', None)
-            session = stripe.checkout.Session.create(**checkout_params)
+        session = _create_session_dropping_bad_methods(checkout_params)
 
         return CheckoutResponse(
             checkout_url=session.url,
