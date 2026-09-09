@@ -617,16 +617,19 @@ def post_google_review_reply(body: PostGoogleReviewReplyRequest):
                     "The request did not reach the Business Profile API. "
                     "Please reply manually and report this — it needs a fix on our side."
                 )
+            # Check "API not enabled" BEFORE the generic permission match: Google returns
+            # this as 403 with "status": "PERMISSION_DENIED", so a bare "permission" test
+            # would swallow it and wrongly blame the connected account's rights.
+            elif "has not been used in project" in err_low or "it is disabled" in err_low:
+                detail = (
+                    "The Google Business Profile (My Business v4) API is not enabled for "
+                    "our project. Please reply manually while we enable it."
+                )
             elif "permission" in err_low or "forbidden" in err_low:
                 detail = (
                     "Google denied permission to read reviews for this location. "
                     "The connected Google account needs owner/manager rights with review "
                     "access on this exact location. Please reply manually for now."
-                )
-            elif "has not been used in project" in err_low or "is disabled" in err_low:
-                detail = (
-                    "The Google Business Profile (My Business v4) API is not enabled for "
-                    "our project. Please reply manually while we enable it."
                 )
             elif "scope" in err_low:
                 detail = (
