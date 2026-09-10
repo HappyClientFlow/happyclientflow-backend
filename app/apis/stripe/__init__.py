@@ -96,11 +96,68 @@ else:
     stripe.api_key = os.environ.get("STRIPE_SECRET_KEY_TEST") or db.secrets.get("STRIPE_SECRET_KEY_TEST")
     STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET_TEST") or db.secrets.get("STRIPE_WEBHOOK_SECRET_TEST")
 
+# Payment methods offered at checkout.
+#
+# Until now payment_method_types was never set, so Stripe decided per session from
+# the dashboard's payment method configuration. That is why card could silently be
+# absent for one amount and present for another (HCL-12) — nothing in this codebase
+# varies by amount or interval. Listing the methods explicitly takes that decision
+# away from Stripe's eligibility engine, which is what "cards must always be
+# available" requires.
+#
+# Trade-off: an explicit list opts out of dynamic payment methods, so new methods
+# have to be added here rather than appearing on their own. The list is therefore
+# overridable without a deploy, via the STRIPE_PAYMENT_METHOD_TYPES env var or
+# secret, as a comma-separated list (e.g. "card,paypal,sepa_debit").
+#
+# Every method named must be activated on the Stripe account and must support
+# recurring payments, or session creation fails outright. create_checkout_session
+# therefore drops whichever method Stripe complains about and retries, so one
+# misconfigured method cannot cost us the card guarantee that this ticket is about.
+DEFAULT_CHECKOUT_PAYMENT_METHOD_TYPES = ["card", "paypal", "klarna", "sepa_debit"]
+
+
+def _resolve_billing_email(company: Dict[str, Any]) -> Optional[str]:
+    """
+    Billing e-mail for a company, taken from its owner in public.users.
+
+    The previous code read company['contact_email'], but the companies table has
+    no such column — so the value was always the '' default and every customer
+    Stripe created here had no e-mail at all. Besides losing receipts, that made
+    the Customer.list(email='') lookup below meaningless.
+    """
+    owner_id = company.get("owner_id")
+    if not owner_id:
+        return None
+    try:
+        res = supabase.table("users").select("email").eq("id", owner_id).single().execute()
+        return ((res.data or {}).get("email") or None)
+    except Exception as e:
+        print(f"[STRIPE] Could not resolve billing e-mail for company {company.get('id')}: {e}")
+        return None
+
+
+def get_checkout_payment_method_types() -> List[str]:
+    """Configured checkout payment methods, falling back to card + PayPal."""
+    raw = os.environ.get("STRIPE_PAYMENT_METHOD_TYPES")
+    if not raw:
+        try:
+            raw = db.secrets.get("STRIPE_PAYMENT_METHOD_TYPES")
+        except Exception:
+            raw = None
+    if raw:
+        types = [t.strip() for t in str(raw).split(",") if t.strip()]
+        if types:
+            return types
+    return list(DEFAULT_CHECKOUT_PAYMENT_METHOD_TYPES)
+
+
 # Startup debug (safe)
 print("[STRIPE] Startup config")
 print(f"[STRIPE] DATABUTTON_SERVICE_TYPE={os.environ.get('DATABUTTON_SERVICE_TYPE')!r} -> mode={mode}")
 print(f"[STRIPE] stripe.api_key: {_secret_debug_info(stripe.api_key)}")
 print(f"[STRIPE] STRIPE_WEBHOOK_SECRET: {_secret_debug_info(STRIPE_WEBHOOK_SECRET)}")
+print(f"[STRIPE] checkout payment_method_types: {get_checkout_payment_method_types()}")
 
 # Initialize Supabase
 supabase_url = db.secrets.get("SUPABASE_URL")
@@ -142,6 +199,51 @@ class ChangePlanRequest(BaseModel):
     company_id: str
     new_plan_type: str
 
+def _create_session_dropping_bad_methods(checkout_params: Dict[str, Any]):
+    """
+    Create the Checkout Session, retiring individual payment methods Stripe refuses.
+
+    A method that is not activated on the account, or that does not support
+    subscriptions, makes the entire session fail — one bad entry would otherwise
+    take checkout down. Stripe names the offending method in the error, so drop
+    that one and try again. Only if nothing can be salvaged do we fall back to
+    Stripe's dynamic methods, which is the case where the card guarantee is lost,
+    so it is logged loudly.
+    """
+    params = dict(checkout_params)
+    # At most one attempt per configured method, plus the dynamic fallback.
+    for _ in range(len(params.get('payment_method_types') or []) + 1):
+        try:
+            return stripe.checkout.Session.create(**params)
+        except stripe.InvalidRequestError as e:
+            message = str(e)
+            if 'payment_method_type' not in message:
+                raise
+
+            current = list(params.get('payment_method_types') or [])
+            rejected = [m for m in current if f"'{m}'" in message or f'"{m}"' in message]
+
+            if rejected and len(current) > len(rejected):
+                remaining = [m for m in current if m not in rejected]
+                print(
+                    f"[STRIPE] Stripe refused payment method(s) {rejected}: {message} "
+                    f"Retrying with {remaining}. Activate them in Stripe or drop them "
+                    "from STRIPE_PAYMENT_METHOD_TYPES."
+                )
+                params['payment_method_types'] = remaining
+                continue
+
+            print(
+                f"[STRIPE] Could not satisfy payment_method_types={current}: {message} "
+                "Falling back to Stripe's dynamic payment methods — card is no longer "
+                "guaranteed until STRIPE_PAYMENT_METHOD_TYPES is fixed."
+            )
+            params.pop('payment_method_types', None)
+
+    # Loop exhausted without returning: try once more with whatever is left.
+    return stripe.checkout.Session.create(**params)
+
+
 @router.post("/create-checkout-session", response_model=CheckoutResponse)
 async def create_checkout_session(request: CheckoutRequest, user_data: str = Depends(require_auth)):
     """
@@ -176,30 +278,35 @@ async def create_checkout_session(request: CheckoutRequest, user_data: str = Dep
             raise HTTPException(status_code=400, detail="Company already has an active subscription")
 
         # Create or retrieve Stripe customer
-        customer_email = company.get('contact_email', '')
+        customer_email = _resolve_billing_email(company)
         customer_name = company.get('name', '')
         existing_customer_id = company.get('stripe_customer_id')
+
+        def _new_customer():
+            # Omit the e-mail rather than sending '', so Stripe does not store a blank.
+            fields = {'name': customer_name}
+            if customer_email:
+                fields['email'] = customer_email
+            return stripe.Customer.create(**fields)
 
         if existing_customer_id:
             try:
                 customer = stripe.Customer.retrieve(existing_customer_id)
             except stripe.InvalidRequestError:
-                customer = stripe.Customer.create(
-                    email=customer_email,
-                    name=customer_name
-                )
+                customer = _new_customer()
                 supabase.table('companies').update({
                     'stripe_customer_id': customer.id
                 }).eq('id', request.company_id).execute()
         else:
-            customers = stripe.Customer.list(email=customer_email, limit=1)
-            if customers.data:
-                customer = customers.data[0]
-            else:
-                customer = stripe.Customer.create(
-                    email=customer_email,
-                    name=customer_name
-                )
+            customer = None
+            # Only reuse by e-mail when we actually have one: listing on '' matches
+            # by nothing meaningful and risks attaching another company's customer.
+            if customer_email:
+                customers = stripe.Customer.list(email=customer_email, limit=1)
+                if customers.data:
+                    customer = customers.data[0]
+            if customer is None:
+                customer = _new_customer()
             supabase.table('companies').update({
                 'stripe_customer_id': customer.id
             }).eq('id', request.company_id).execute()
@@ -251,9 +358,12 @@ async def create_checkout_session(request: CheckoutRequest, user_data: str = Dep
                 'extra_seats': str(request.extra_seats),
             },
             'allow_promotion_codes': True,
+            # Name the methods explicitly so card cannot be dropped by Stripe's
+            # per-session eligibility decisions (HCL-12).
+            'payment_method_types': get_checkout_payment_method_types(),
         }
 
-        session = stripe.checkout.Session.create(**checkout_params)
+        session = _create_session_dropping_bad_methods(checkout_params)
 
         return CheckoutResponse(
             checkout_url=session.url,
