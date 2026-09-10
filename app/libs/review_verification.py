@@ -595,11 +595,15 @@ def run_external_review_verification_sync(
     asyncio.run(run_external_review_verification(client_id, clicked_profile_type))
 
 
-def process_pending_verification_retries(
+def _pending_retry_client_ids(
     limit: int = 40, company_id: Optional[str] = None
-) -> int:
+) -> List[str]:
     """
-    Re-run verification for recent pending/inconclusive rows (cron).
+    Distinct client ids a retry run would actually re-verify, in order.
+
+    Split out of process_pending_verification_retries so the dashboard can say
+    up front how much work it just started — previously the endpoint reported
+    "started" whether or not there was anything to do.
     """
     supabase = _service_supabase()
     res = (
@@ -611,6 +615,7 @@ def process_pending_verification_retries(
         .execute()
     )
     rows = getattr(res, "data", None) or []
+
     allowed_clients: Optional[set[str]] = None
     if company_id:
         cres = (
@@ -621,6 +626,35 @@ def process_pending_verification_retries(
         )
         crows = getattr(cres, "data", None) or []
         allowed_clients = {str(c.get("id")) for c in crows if c.get("id")}
+
+    seen: set[str] = set()
+    out: List[str] = []
+    for r in rows:
+        cid = r.get("client_id")
+        if not cid or cid in seen:
+            continue
+        if allowed_clients is not None and cid not in allowed_clients:
+            continue
+        seen.add(cid)
+        out.append(cid)
+    return out
+
+
+def count_pending_verification_retries(
+    limit: int = 40, company_id: Optional[str] = None
+) -> int:
+    """How many clients a retry run would re-verify right now."""
+    return len(_pending_retry_client_ids(limit=limit, company_id=company_id))
+
+
+def process_pending_verification_retries(
+    limit: int = 40, company_id: Optional[str] = None
+) -> int:
+    """
+    Re-run verification for recent pending/inconclusive rows (cron).
+    """
+    rows = [{"client_id": cid} for cid in _pending_retry_client_ids(limit, company_id)]
+    allowed_clients: Optional[set[str]] = None
     seen_client: set[str] = set()
     n = 0
     for r in rows:
