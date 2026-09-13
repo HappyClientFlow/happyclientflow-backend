@@ -32,6 +32,12 @@ class ReviewData(BaseModel):
     time: int
     profile_photo_url: Optional[str] = None
     relative_time_description: str
+    # The business owner's public reply, when the review already has one. Lets the
+    # UI show it and stop offering "Answer" for a review that is already answered —
+    # including ones answered directly in Google, outside HCF.
+    # Both default to None so entries cached under the previous shape still parse.
+    owner_reply: Optional[str] = None
+    owner_reply_at: Optional[int] = None
 
 class PlaceDetailsResponse(BaseModel):
     place_id: str
@@ -65,15 +71,75 @@ def parse_iso_to_unix(iso_date: str) -> int:
     except (ValueError, TypeError):
         return 0
 
+# Apify has used more than one shape for the owner response over the actor's
+# lifetime, and the exact key cannot be confirmed without a live run. Accept the
+# known variants rather than betting on one, and log anything response-shaped that
+# none of them matched, so a mismatch shows up in the logs instead of silently
+# leaving every review looking unanswered.
+_OWNER_REPLY_TEXT_KEYS = (
+    "responseFromOwnerText",
+    "ownerResponseText",
+    "responseFromOwner",
+)
+_OWNER_REPLY_DATE_KEYS = (
+    "responseFromOwnerDate",
+    "ownerResponseDate",
+)
+
+
+def _extract_owner_reply(apify_review: dict) -> tuple[Optional[str], Optional[int]]:
+    """Owner reply text and time from an Apify review item, if it carries one."""
+    text: Optional[str] = None
+    nested_date: Optional[str] = None
+    for k in _OWNER_REPLY_TEXT_KEYS:
+        v = apify_review.get(k)
+        if isinstance(v, dict):  # some shapes nest it as {"text": ..., "date": ...}
+            nested_date = v.get("date") or v.get("publishedAtDate")
+            v = v.get("text")
+        if isinstance(v, str) and v.strip():
+            text = v.strip()
+            break
+        nested_date = None
+
+    if text is None:
+        # Nothing matched — surface unknown response-shaped keys once per review.
+        unknown = [
+            k for k in apify_review
+            if ("response" in k.lower() or "ownerreply" in k.lower().replace("_", ""))
+            and k not in _OWNER_REPLY_TEXT_KEYS
+            and k not in _OWNER_REPLY_DATE_KEYS
+        ]
+        if unknown:
+            print(
+                "[REVIEWS] Unrecognised owner-response field(s) on an Apify review: "
+                f"{unknown} — owner_reply mapping may need updating."
+            )
+        return None, None
+
+    at: Optional[int] = None
+    # A nested shape carries its own date; otherwise look for a sibling key.
+    for raw in (nested_date, *(apify_review.get(k) for k in _OWNER_REPLY_DATE_KEYS)):
+        if isinstance(raw, str) and raw.strip():
+            parsed = parse_iso_to_unix(raw)
+            if parsed:
+                at = parsed
+                break
+
+    return text, at
+
+
 def transform_apify_review_to_review_data(apify_review: dict) -> ReviewData:
     """Transform Apify review format to our ReviewData format."""
+    owner_reply, owner_reply_at = _extract_owner_reply(apify_review)
     return ReviewData(
         author_name=apify_review.get("name", "Anonymous"),
         rating=apify_review.get("stars", 0),
         text=apify_review.get("text") or "",  # Handle null text
         time=parse_iso_to_unix(apify_review.get("publishedAtDate", "")),
         profile_photo_url=apify_review.get("reviewerPhotoUrl"),
-        relative_time_description=apify_review.get("publishAt", "")
+        relative_time_description=apify_review.get("publishAt", ""),
+        owner_reply=owner_reply,
+        owner_reply_at=owner_reply_at,
     )
 
 async def fetch_reviews_from_apify(
