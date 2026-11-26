@@ -7,6 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 dotenv.load_dotenv()
 
+# Secrets come from environment variables (Render), not from the Databutton API.
+# Must run before the API modules are imported: some read secrets at import time.
+from app.libs.env_secrets import install as install_env_secrets
+
+install_env_secrets()
+
 from databutton_app.mw.auth_mw import AuthConfig, get_authorized_user
 
 
